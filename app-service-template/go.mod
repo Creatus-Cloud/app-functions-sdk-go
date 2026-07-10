@@ -139,3 +139,5 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	nhooyr.io/websocket v1.8.17 // indirect
 )
+
+replace github.com/edgexfoundry/go-mod-messaging/v4 => github.com/Creatus-Cloud/go-mod-messaging/v4 v4.0.3-0.20260710085357-7659e9840468

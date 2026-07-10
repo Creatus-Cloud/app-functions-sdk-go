@@ -39,6 +39,8 @@ cloud.google.com/go/storage v1.10.0/go.mod h1:FLPqc6j+Ki4BU591ie1oL6qBQGu2Bl/tZ9
 dmitri.shuralyov.com/gpu/mtl v0.0.0-20190408044501-666a987793e9/go.mod h1:H6x//7gZCb22OMCxBHrMx7a5I7Hp++hsVxbQ4BYO7hU=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
+github.com/Creatus-Cloud/go-mod-messaging/v4 v4.0.3-0.20260710085357-7659e9840468 h1:RwzZY7ivUFusoFmv2y0PHz+NBL2ZGhpNcWKi15u1uHE=
+github.com/Creatus-Cloud/go-mod-messaging/v4 v4.0.3-0.20260710085357-7659e9840468/go.mod h1:/skwSGlxA9qe6b5ZsSRIbAB9yw3XV8QFcEmEW9CxEw4=
 github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERoyfY=
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
 github.com/antihax/optional v1.0.0/go.mod h1:uupD/76wgC+ih3iEmQUL+0Ugr19nfwCT1kdvxnR2qWY=
@@ -80,8 +82,6 @@ github.com/edgexfoundry/go-mod-configuration/v4 v4.0.2 h1:quoEb8V1hJEu69yIPOHvyN
 github.com/edgexfoundry/go-mod-configuration/v4 v4.0.2/go.mod h1:nJCcQr9NGJnNHMF+Nk/f68sHZTfGfb2F57Yd8T80Tz0=
 github.com/edgexfoundry/go-mod-core-contracts/v4 v4.0.2 h1:U1iXpuRmAm1EG6ld7VSEoIwxTOsi/ipg3GtYWsAZ1AI=
 github.com/edgexfoundry/go-mod-core-contracts/v4 v4.0.2/go.mod h1:AF1bbO7aA1ZdtZ7r/lQHV4OjiHtSzK5iDiW+PqWDCUc=
-github.com/edgexfoundry/go-mod-messaging/v4 v4.0.2 h1:/YARz87MiIUeOZhNmBQpaUjCeL5zM5BalUSFYo9iF/0=
-github.com/edgexfoundry/go-mod-messaging/v4 v4.0.2/go.mod h1:/skwSGlxA9qe6b5ZsSRIbAB9yw3XV8QFcEmEW9CxEw4=
 github.com/edgexfoundry/go-mod-registry/v4 v4.0.1 h1:U5HcQ4dChjrC1ZQttzP4SmWZ11xjTUzzKa55Pk3t8Z4=
 github.com/edgexfoundry/go-mod-registry/v4 v4.0.1/go.mod h1:qKkvkSOdDDQZMeeDYI4nOhjsx719N1Dp26AhMMvMGuY=
 github.com/edgexfoundry/go-mod-secrets/v4 v4.0.1 h1:YUQIUvMzQSZLR/bR4qNLMw6woCZo3RZJWaGd2i/6TsA=
