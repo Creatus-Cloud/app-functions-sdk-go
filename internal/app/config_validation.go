@@ -3,9 +3,11 @@ package app
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/internal/common"
+	"github.com/edgexfoundry/app-functions-sdk-go/v4/internal/trigger/mqtt"
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/pkg/configvalidation"
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/pkg/interfaces"
 	"github.com/labstack/echo/v4"
@@ -20,6 +22,14 @@ func (svc *Service) initializeConfigValidation() error {
 		}
 		if err := configvalidation.ValidateTelemetry(c.Writable.Telemetry); err != nil {
 			return err
+		}
+		if err := svc.validateTriggerType(c.Trigger.Type); err != nil {
+			return err
+		}
+		if strings.EqualFold(c.Trigger.Type, TriggerTypeMQTT) {
+			if err := mqtt.ValidateConfig(c.Trigger); err != nil {
+				return err
+			}
 		}
 		if c.Writable.StoreAndForward.Enabled {
 			d, err := time.ParseDuration(c.Writable.StoreAndForward.RetryInterval)

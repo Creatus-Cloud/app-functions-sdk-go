@@ -112,7 +112,7 @@ func TestAddCustomRouteAuthenticated(t *testing.T) {
 
 }
 
-func createSdkAndRouter() (Service, *echo.Echo) {
+func createSdkAndRouter() (*Service, *echo.Echo) {
 	router := echo.New()
 
 	ws := webserver.NewWebServer(dic, router, uuid.NewString())
@@ -121,7 +121,7 @@ func createSdkAndRouter() (Service, *echo.Echo) {
 		webserver: ws,
 		dic:       dic,
 	}
-	return sdk, router
+	return &sdk, router
 }
 
 func verifyPath(t *testing.T, expectedPath string, router *echo.Echo) {

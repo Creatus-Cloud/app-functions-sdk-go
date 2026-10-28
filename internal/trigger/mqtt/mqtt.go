@@ -25,7 +25,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/internal/common"
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/internal/trigger"
@@ -81,7 +80,6 @@ func (trigger *Trigger) Initialize(_ *sync.WaitGroup, ctx context.Context, backg
 	config := trigger.serviceBinding.Config()
 
 	brokerConfig := config.Trigger.ExternalMqtt
-	topics := config.Trigger.SubscribeTopics
 
 	trigger.qos = brokerConfig.QoS
 	trigger.retain = brokerConfig.Retain
@@ -93,26 +91,16 @@ func (trigger *Trigger) Initialize(_ *sync.WaitGroup, ctx context.Context, backg
 		return nil, errors.New("background publishing not supported for services using MQTT trigger")
 	}
 
-	if len(strings.TrimSpace(topics)) == 0 {
-		return nil, fmt.Errorf("missing SubscribeTopics for MQTT Trigger. Must be present in [Trigger.ExternalMqtt] section")
-	}
-
-	brokerUrl, err := url.Parse(brokerConfig.Url)
+	brokerUrl, connectTimeout, err := parseConfig(config.Trigger)
 	if err != nil {
-		return nil, fmt.Errorf("invalid MQTT Broker Url '%s': %s", config.Trigger.ExternalMqtt.Url, err.Error())
+		return nil, err
 	}
 
 	opts := pahoMqtt.NewClientOptions()
 	opts.AutoReconnect = brokerConfig.AutoReconnect
 	opts.OnConnect = trigger.onConnectHandler
 	opts.ClientID = brokerConfig.ClientId
-	if len(brokerConfig.ConnectTimeout) > 0 {
-		duration, err := time.ParseDuration(brokerConfig.ConnectTimeout)
-		if err != nil {
-			return nil, fmt.Errorf("invalid MQTT ConnectTimeout '%s': %s", brokerConfig.ConnectTimeout, err.Error())
-		}
-		opts.ConnectTimeout = duration
-	}
+	opts.ConnectTimeout = connectTimeout
 	opts.KeepAlive = brokerConfig.KeepAlive
 	opts.Servers = []*url.URL{brokerUrl}
 

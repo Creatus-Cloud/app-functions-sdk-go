@@ -37,6 +37,10 @@ const (
 )
 
 func (svc *Service) setupTrigger(configuration *common.ConfigurationStruct) interfaces.Trigger {
+	if err := svc.validateTriggerType(configuration.Trigger.Type); err != nil {
+		svc.LoggingClient().Error("Invalid trigger configuration", "error", err)
+		return nil
+	}
 	var t interfaces.Trigger
 
 	serviceBinding := NewTriggerServiceBinding(svc)
@@ -56,17 +60,13 @@ func (svc *Service) setupTrigger(configuration *common.ConfigurationStruct) inte
 		t = mqtt.NewTriggerWithCredentialsProvider(serviceBinding, messageProcessor, svc.externalMqttCredentials)
 
 	default:
-		if factory, found := svc.customTriggerFactories[triggerType]; found {
+		if factory, found := svc.customTriggerFactory(triggerType); found {
 			var err error
 			t, err = factory(svc)
 			if err != nil {
 				svc.LoggingClient().Errorf("failed to initialize custom trigger [%s]: %s", triggerType, err.Error())
 				return nil
 			}
-		} else if len(configuration.Trigger.Type) == 0 {
-			svc.LoggingClient().Error("Trigger type not found, missing common config? Use -cp or -cc flags for common config")
-		} else {
-			svc.LoggingClient().Errorf("Invalid Trigger type of '%s' specified", configuration.Trigger.Type)
 		}
 	}
 
@@ -84,6 +84,11 @@ func (svc *Service) RegisterCustomTriggerFactory(name string,
 		return fmt.Errorf("cannot register custom trigger for builtin type (%s)", name)
 	}
 
+	if factory == nil {
+		return fmt.Errorf("custom trigger factory is required")
+	}
+	svc.customTriggerMu.Lock()
+	defer svc.customTriggerMu.Unlock()
 	if svc.customTriggerFactories == nil {
 		svc.customTriggerFactories = make(map[string]func(sdk *Service) (interfaces.Trigger, error), 1)
 	}
@@ -103,4 +108,23 @@ func (svc *Service) RegisterCustomTriggerFactory(name string,
 	}
 
 	return nil
+}
+
+func (svc *Service) customTriggerFactory(name string) (func(*Service) (interfaces.Trigger, error), bool) {
+	svc.customTriggerMu.RLock()
+	defer svc.customTriggerMu.RUnlock()
+	factory, ok := svc.customTriggerFactories[strings.ToUpper(name)]
+	return factory, ok
+}
+
+func (svc *Service) validateTriggerType(name string) error {
+	switch strings.ToUpper(name) {
+	case TriggerTypeHTTP, TriggerTypeMQTT, TriggerTypeMessageBus:
+		return nil
+	default:
+		if _, ok := svc.customTriggerFactory(name); ok {
+			return nil
+		}
+		return fmt.Errorf("Trigger.Type %q is not registered", name)
+	}
 }
