@@ -18,6 +18,9 @@ func (svc *Service) initializeConfigValidation() error {
 		if err := configvalidation.ValidateService(c.Service, c.Writable.LogLevel); err != nil {
 			return err
 		}
+		if err := configvalidation.ValidateTelemetry(c.Writable.Telemetry); err != nil {
+			return err
+		}
 		if c.Writable.StoreAndForward.Enabled {
 			d, err := time.ParseDuration(c.Writable.StoreAndForward.RetryInterval)
 			if err != nil || d <= 0 {

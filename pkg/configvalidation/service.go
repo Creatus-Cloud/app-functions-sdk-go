@@ -27,3 +27,15 @@ func ValidateService(service config.ServiceInfo, logLevel string) error {
 	}
 	return nil
 }
+
+// ValidateTelemetry checks the duration used by the metrics ticker.
+// Empty and zero intervals disable telemetry reporting.
+func ValidateTelemetry(telemetry config.TelemetryInfo) error {
+	if telemetry.Interval == "" {
+		return nil
+	}
+	if interval, err := time.ParseDuration(telemetry.Interval); err != nil || interval < 0 {
+		return fmt.Errorf("Writable.Telemetry.Interval must be a non-negative duration")
+	}
+	return nil
+}
