@@ -21,3 +21,54 @@ Please refer to the EdgeX Foundry [versioning policy](https://wiki.edgexfoundry.
 ## Long Term Support
 
 Please refer to the EdgeX Foundry [LTS policy](https://wiki.edgexfoundry.org/display/FA/Long+Term+Support) for information on support of EdgeX releases. The EdgeX community does not offer support on any non-LTS release outside of the latest release.
+
+## Configuration preflight (Creatus)
+
+The SDK exposes authenticated `POST /api/v3/config/validate`. Authenticated `GET` on the same route lists
+`serviceID` and known configuration `sections` (names only). app-config uses this to
+exclude shared defaults the receiving service does not use. The request has a
+`serviceID` matching this service and a `configuration` object whose values are
+strings and whose keys are relative Keeper paths, for example
+`AppCustom/Limit`. Send the complete proposed service configuration, including
+applicable common layers, rather than a patch or the entire gateway snapshot.
+
+Register the existing validator directly during application startup or driver
+`Initialize`, using the SDK's `RegisterCustomConfigValidator` method:
+
+```go
+if err := app.service.RegisterCustomConfigValidator(
+    &config.ServiceConfig{}, appCustomConfigName, app.validateConfig,
+); err != nil {
+    return err
+}
+```
+
+The prototype is the same outer struct used with `LoadCustomConfig`, containing
+only the named top-level section (for example `AppCustom`). The callback has
+signature `func(any) error` and receives that outer struct. Reuse the validation
+method called by startup and Core Keeper updates, including any combined checks.
+Runtime application callbacks remain separate.
+
+The SDK retains only the prototype's type and creates a fresh zero-valued object
+for every request. Prototype values and live settings are never copied into a
+candidate, so deleting a required setting cannot be hidden by an old value.
+Keeper's mapstructure conventions apply. The validator may prepare or normalize
+the isolated candidate, but must not perform I/O or mutate live state.
+`LoadCustomConfig` only records which sections need validation; it never discovers
+methods. A loaded section without an explicit validator blocks preflight,
+including when the candidate omits it.
+
+`ApplicationService` and `DeviceServiceSDK` now expose this registration API.
+Consumers require an SDK release containing it. Existing factory-based
+`ConfigValidationRegistrar` registration remains available for configuration
+groups requiring a custom factory.
+
+Validation rejects wrong service IDs, unknown sections/fields, invalid value
+types, and failures returned by custom validators. Standard configuration is
+type checked and common service settings are checked; this does not invent
+protocol-specific rules absent from a driver. Success is HTTP 200 with
+`{"serviceID":"...","valid":true}`. Invalid configuration is HTTP 422 with
+`errors` containing paths and messages; malformed requests are HTTP 400.
+Request bodies are limited to 4 MiB. The device SDK additionally accepts
+`devices` belonging to this service and calls its existing `ValidateDevice`
+hook. Validation does not write to Core Keeper or replace active settings.

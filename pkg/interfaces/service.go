@@ -185,6 +185,10 @@ type ApplicationService interface {
 	// UpdateFromRaw interface will be called on the custom configuration when the configuration is loaded from the
 	// Configuration Provider.
 	LoadCustomConfig(config UpdatableConfig, sectionName string) error
+	// RegisterCustomConfigValidator registers a read-only validator for one custom section.
+	// Pass the outer config struct used by LoadCustomConfig, containing only sectionName.
+	// The SDK creates a fresh zero-valued candidate for every validation request.
+	RegisterCustomConfigValidator(prototype any, sectionName string, validate func(any) error) error
 	// ListenForCustomConfigChanges starts a listener on the Configuration Provider for changes to the specified
 	// section of the custom configuration. When changes are received from the Configuration Provider the
 	// UpdateWritableFromRaw interface will be called on the custom configuration to apply the updates and then signal

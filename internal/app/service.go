@@ -30,12 +30,6 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
-	bootstrapHandlers "github.com/edgexfoundry/go-mod-bootstrap/v4/bootstrap/handlers"
-	"github.com/edgexfoundry/go-mod-core-contracts/v4/dtos"
-	"github.com/edgexfoundry/go-mod-messaging/v4/pkg/types"
-	"github.com/google/uuid"
-	"github.com/labstack/echo/v4"
-
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/internal"
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/internal/appfunction"
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/internal/bootstrap/container"
@@ -43,22 +37,27 @@ import (
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/internal/common"
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/internal/runtime"
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/internal/webserver"
+	"github.com/edgexfoundry/app-functions-sdk-go/v4/pkg/configvalidation"
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/pkg/interfaces"
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/pkg/util"
-	clientInterfaces "github.com/edgexfoundry/go-mod-core-contracts/v4/clients/interfaces"
-	"github.com/edgexfoundry/go-mod-core-contracts/v4/clients/logger"
-	coreCommon "github.com/edgexfoundry/go-mod-core-contracts/v4/common"
-	"github.com/edgexfoundry/go-mod-core-contracts/v4/models"
-	"github.com/edgexfoundry/go-mod-registry/v4/registry"
-
 	"github.com/edgexfoundry/go-mod-bootstrap/v4/bootstrap"
 	"github.com/edgexfoundry/go-mod-bootstrap/v4/bootstrap/config"
 	bootstrapContainer "github.com/edgexfoundry/go-mod-bootstrap/v4/bootstrap/container"
 	"github.com/edgexfoundry/go-mod-bootstrap/v4/bootstrap/flags"
+	bootstrapHandlers "github.com/edgexfoundry/go-mod-bootstrap/v4/bootstrap/handlers"
 	bootstrapInterfaces "github.com/edgexfoundry/go-mod-bootstrap/v4/bootstrap/interfaces"
 	"github.com/edgexfoundry/go-mod-bootstrap/v4/bootstrap/startup"
 	bootstrapConfig "github.com/edgexfoundry/go-mod-bootstrap/v4/config"
 	"github.com/edgexfoundry/go-mod-bootstrap/v4/di"
+	clientInterfaces "github.com/edgexfoundry/go-mod-core-contracts/v4/clients/interfaces"
+	"github.com/edgexfoundry/go-mod-core-contracts/v4/clients/logger"
+	coreCommon "github.com/edgexfoundry/go-mod-core-contracts/v4/common"
+	"github.com/edgexfoundry/go-mod-core-contracts/v4/dtos"
+	"github.com/edgexfoundry/go-mod-core-contracts/v4/models"
+	"github.com/edgexfoundry/go-mod-messaging/v4/pkg/types"
+	"github.com/edgexfoundry/go-mod-registry/v4/registry"
+	"github.com/google/uuid"
+	"github.com/labstack/echo/v4"
 )
 
 const (
@@ -87,6 +86,7 @@ func NewService(serviceKey string, targetType interface{}, profileSuffixPlacehol
 // Service provides the necessary struct and functions to create an instance of the
 // interfaces.ApplicationService interface.
 type Service struct {
+	configValidation           *configvalidation.Registry
 	dic                        *di.Container
 	serviceKey                 string
 	targetType                 interface{}
@@ -589,6 +589,9 @@ func (svc *Service) Initialize() error {
 
 	svc.webserver = webserver.NewWebServer(svc.dic, echo.New(), svc.serviceKey)
 	svc.webserver.ConfigureCors()
+	if err := svc.initializeConfigValidation(); err != nil {
+		return err
+	}
 
 	svc.lc.Info("Service started in: " + startupTimer.SinceAsString())
 
@@ -608,6 +611,11 @@ func (svc *Service) LoadCustomConfig(customConfig interfaces.UpdatableConfig, se
 	}
 
 	svc.webserver.SetCustomConfigInfo(customConfig)
+	if svc.configValidation != nil {
+		if err := svc.configValidation.RequireValidator(customConfig); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
