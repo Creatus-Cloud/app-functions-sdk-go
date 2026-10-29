@@ -2,7 +2,10 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 
@@ -36,7 +39,7 @@ func TestConfigPreflightTelemetryInterval(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			result := sdk.configValidation.Validate(configvalidation.Request{
 				ServiceID: "test-service",
-				Configuration: map[string]string{
+				Configuration: map[string]any{
 					"Service/Host":                "localhost",
 					"Service/Port":                "59701",
 					"Service/RequestTimeout":      "5s",
@@ -77,7 +80,7 @@ func TestConfigPreflightMQTTConnectTimeout(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			result := sdk.configValidation.Validate(configvalidation.Request{
 				ServiceID: "test-service",
-				Configuration: map[string]string{
+				Configuration: map[string]any{
 					"Service/Host": "localhost", "Service/Port": "59701",
 					"Service/RequestTimeout": "5s", "Writable/LogLevel": "INFO",
 					"Trigger/Type":                        test.trigger,
@@ -98,7 +101,7 @@ func TestConfigPreflightMQTTTimeoutMatchesStartup(t *testing.T) {
 	sdk, _ := createSdkAndRouter()
 	sdk.serviceKey = "test-service"
 	require.NoError(t, sdk.initializeConfigValidation())
-	result := sdk.configValidation.Validate(configvalidation.Request{ServiceID: "test-service", Configuration: map[string]string{
+	result := sdk.configValidation.Validate(configvalidation.Request{ServiceID: "test-service", Configuration: map[string]any{
 		"Service/Host": "localhost", "Service/Port": "59701", "Service/RequestTimeout": "5s", "Writable/LogLevel": "INFO",
 		"Trigger/Type": "external-mqtt", "Trigger/SubscribeTopics": "requests/#", "Trigger/ExternalMqtt/Url": "tcp://localhost:1883", "Trigger/ExternalMqtt/ConnectTimeout": "invalid",
 	}})
@@ -114,4 +117,19 @@ func TestConfigPreflightMQTTTimeoutMatchesStartup(t *testing.T) {
 	_, startupErr := trigger.Initialize(&sync.WaitGroup{}, context.Background(), nil)
 	require.ErrorContains(t, startupErr, "invalid MQTT ConnectTimeout")
 	require.False(t, result.Valid, "preflight accepts MQTT timeout rejected by normal startup")
+}
+
+func TestInitializedCapabilitiesShareOnlyStandardConfiguration(t *testing.T) {
+	sdk, _ := createSdkAndRouter()
+	require.NoError(t, sdk.initializeConfigValidation())
+	require.NoError(t, sdk.RegisterCustomConfigValidator(&struct{ AppCustom struct{ Limit int } }{}, "AppCustom", func(any) error { return nil }))
+	response := httptest.NewRecorder()
+	sdk.configValidation.ServeHTTP(response, httptest.NewRequest(http.MethodGet, configvalidation.Route, nil))
+	var capabilities configvalidation.Capabilities
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &capabilities))
+	require.Contains(t, capabilities.Sections, "AppCustom")
+	require.NotContains(t, capabilities.SharedSections, "AppCustom")
+	for _, section := range []string{"Service", "Writable", "Trigger"} {
+		require.Contains(t, capabilities.SharedSections, section)
+	}
 }

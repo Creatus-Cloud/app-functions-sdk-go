@@ -16,7 +16,7 @@ import (
 )
 
 func triggerCandidate(config common.TriggerInfo) configvalidation.Request {
-	return configvalidation.Request{ServiceID: "test-service", Configuration: map[string]string{
+	return configvalidation.Request{ServiceID: "test-service", Configuration: map[string]any{
 		"Service/Host": "localhost", "Service/Port": "59701",
 		"Service/RequestTimeout": "5s", "Writable/LogLevel": "INFO",
 		"Trigger/Type":                        config.Type,

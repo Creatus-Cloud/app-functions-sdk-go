@@ -15,7 +15,7 @@ import (
 
 func (svc *Service) initializeConfigValidation() error {
 	svc.configValidation = configvalidation.New(svc.serviceKey)
-	if err := svc.configValidation.Register(func() any { return &common.ConfigurationStruct{} }, func(raw any) error {
+	if err := svc.configValidation.RegisterStandard(func() any { return &common.ConfigurationStruct{} }, func(raw any) error {
 		c := raw.(*common.ConfigurationStruct)
 		if err := configvalidation.ValidateService(c.Service, c.Writable.LogLevel); err != nil {
 			return err

@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -20,10 +22,11 @@ const MaxRequestBytes = 4 << 20
 
 // Request contains only relative keys belonging to ServiceID. Configuration must
 // be the complete candidate, including applicable common configuration layers.
+// Scalars are converted to Keeper's persisted text before decoding the candidate.
 type Request struct {
-	ServiceID     string            `json:"serviceID"`
-	Configuration map[string]string `json:"configuration"`
-	Devices       []dtos.Device     `json:"devices,omitempty"`
+	ServiceID     string         `json:"serviceID"`
+	Configuration map[string]any `json:"configuration"`
+	Devices       []dtos.Device  `json:"devices,omitempty"`
 }
 type Issue struct {
 	Path    string `json:"path"`
@@ -31,11 +34,12 @@ type Issue struct {
 }
 
 // Capabilities lists sections used by this service without exposing values.
-// Known custom sections without a validator remain listed so shared defaults
-// cannot hide a missing validator by being discarded during projection.
+// SharedSections identifies only standard sections loaded from common config.
+// Custom configuration is loaded exclusively from the private service prefix.
 type Capabilities struct {
-	ServiceID string   `json:"serviceID"`
-	Sections  []string `json:"sections"`
+	ServiceID      string   `json:"serviceID"`
+	Sections       []string `json:"sections"`
+	SharedSections []string `json:"sharedSections"`
 }
 
 type Response struct {
@@ -52,21 +56,32 @@ type registration struct {
 
 // Registry owns immutable factories, never live service configuration pointers.
 type Registry struct {
-	serviceID     string
-	mu            sync.RWMutex
-	entries       []registration
-	sections      map[string]bool
-	knownSections map[string]bool
-	devices       func([]dtos.Device) error
+	serviceID      string
+	mu             sync.RWMutex
+	entries        []registration
+	sections       map[string]bool
+	knownSections  map[string]bool
+	sharedSections map[string]bool
+	devices        func([]dtos.Device) error
 }
 
 func New(serviceID string) *Registry {
-	return &Registry{serviceID: serviceID, sections: make(map[string]bool), knownSections: make(map[string]bool)}
+	return &Registry{serviceID: serviceID, sections: make(map[string]bool), knownSections: make(map[string]bool), sharedSections: make(map[string]bool)}
 }
 
-// Register adds a configuration group. The factory must return a fresh pointer
-// to a struct on every call. Top-level struct fields are its allowed sections.
+// Register adds a private configuration group. The factory must return a fresh
+// pointer to a struct on every call. Top-level fields are its allowed sections.
 func (r *Registry) Register(factory func() any, validate func(any) error) error {
+	return r.register(factory, validate, false)
+}
+
+// RegisterStandard adds the SDK's standard configuration, whose sections can
+// inherit common configuration. Custom sections must use RegisterCustom instead.
+func (r *Registry) RegisterStandard(factory func() any, validate func(any) error) error {
+	return r.register(factory, validate, true)
+}
+
+func (r *Registry) register(factory func() any, validate func(any) error, shared bool) error {
 	if factory == nil || validate == nil {
 		return fmt.Errorf("config validator factory and function are required")
 	}
@@ -84,6 +99,9 @@ func (r *Registry) Register(factory func() any, validate func(any) error) error 
 	for _, name := range sections {
 		r.sections[name] = true
 		r.knownSections[name] = true
+		if shared {
+			r.sharedSections[name] = true
+		}
 	}
 	r.entries = append(r.entries, registration{sections, factory, validate})
 	return nil
@@ -190,6 +208,7 @@ func (r *Registry) Validate(request Request) Response {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	values := make(map[string]any, len(keys))
 	for _, key := range keys {
 		parts := strings.Split(key, "/")
 		valid := true
@@ -200,6 +219,12 @@ func (r *Registry) Validate(request Request) Response {
 		}
 		if !valid || !sections[parts[0]] {
 			fail(key, "unknown or unregistered configuration section")
+		}
+		value, err := configurationScalar(request.Configuration[key])
+		if err != nil {
+			fail(key, err.Error())
+		} else {
+			values[key] = value
 		}
 	}
 	if len(result.Errors) > 0 {
@@ -219,7 +244,7 @@ func (r *Registry) Validate(request Request) Response {
 			if !owned {
 				continue
 			}
-			if err := insert(raw, key, request.Configuration[key]); err != nil {
+			if err := insert(raw, key, values[key]); err != nil {
 				fail(key, err.Error())
 			}
 		}
@@ -256,7 +281,33 @@ func (r *Registry) Validate(request Request) Response {
 	return result
 }
 
-func insert(raw map[string]any, path, value string) error {
+// configurationScalar mirrors Keeper's JSON decoding followed by cast.ToString
+// persistence. The runtime loads these strings, not the original JSON types.
+// Normalize native Go numbers too, so direct Validate calls behave like HTTP.
+// Nested objects and null are not flattened configuration leaves.
+func configurationScalar(value any) (any, error) {
+	switch typed := value.(type) {
+	case string:
+		return typed, nil
+	case bool:
+		return strconv.FormatBool(typed), nil
+	case float64:
+		if !math.IsNaN(typed) && !math.IsInf(typed, 0) {
+			return strconv.FormatFloat(typed, 'f', -1, 64), nil
+		}
+	case json.Number, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		encoded, err := json.Marshal(value)
+		if err == nil {
+			var number float64
+			if json.Unmarshal(encoded, &number) == nil {
+				return strconv.FormatFloat(number, 'f', -1, 64), nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("configuration values must be strings, booleans, or finite numbers")
+}
+
+func insert(raw map[string]any, path string, value any) error {
 	parts := strings.Split(path, "/")
 	current := raw
 	for _, part := range parts[:len(parts)-1] {
@@ -289,9 +340,14 @@ func (r *Registry) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		for section := range r.knownSections {
 			sections = append(sections, section)
 		}
+		shared := make([]string, 0, len(r.sharedSections))
+		for section := range r.sharedSections {
+			shared = append(shared, section)
+		}
 		r.mu.RUnlock()
 		sort.Strings(sections)
-		if err := json.NewEncoder(w).Encode(Capabilities{ServiceID: r.serviceID, Sections: sections}); err != nil {
+		sort.Strings(shared)
+		if err := json.NewEncoder(w).Encode(Capabilities{ServiceID: r.serviceID, Sections: sections, SharedSections: shared}); err != nil {
 			return
 		}
 		return

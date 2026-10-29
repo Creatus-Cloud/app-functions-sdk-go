@@ -42,7 +42,7 @@ func TestFreshCandidateAndKeeperDecoding(t *testing.T) {
 	r := New("app-one")
 	require.NoError(t, r.RequireValidator(live))
 	require.NoError(t, r.Register(func() any { return &customConfig{} }, func(raw any) error { return raw.(*customConfig).Validate() }))
-	request := Request{ServiceID: "app-one", Configuration: map[string]string{"AppCustom/Limit": "2", "AppCustom/Enabled": "true", "AppCustom/LegacyEntries/example": "4"}}
+	request := Request{ServiceID: "app-one", Configuration: map[string]any{"AppCustom/Limit": "2", "AppCustom/Enabled": "true", "AppCustom/LegacyEntries/example": "4"}}
 	var wg sync.WaitGroup
 	for range 20 {
 		wg.Add(1)
@@ -64,15 +64,15 @@ func TestRejectInvalidOrForeignConfiguration(t *testing.T) {
 		name    string
 		request Request
 	}{
-		{"wrong service", Request{ServiceID: "app-two", Configuration: map[string]string{"AppCustom/Limit": "2"}}},
+		{"wrong service", Request{ServiceID: "app-two", Configuration: map[string]any{"AppCustom/Limit": "2"}}},
 		{"missing configuration", Request{ServiceID: "app-one"}},
-		{"full gateway path", Request{ServiceID: "app-one", Configuration: map[string]string{"edgex/v4/app-one/AppCustom/Limit": "2"}}},
-		{"unknown section", Request{ServiceID: "app-one", Configuration: map[string]string{"Other/Limit": "2"}}},
-		{"unknown nested field", Request{ServiceID: "app-one", Configuration: map[string]string{"AppCustom/Limit": "2", "AppCustom/Typo": "1"}}},
-		{"invalid type", Request{ServiceID: "app-one", Configuration: map[string]string{"AppCustom/Limit": "secret-value"}}},
-		{"deleted required value", Request{ServiceID: "app-one", Configuration: map[string]string{}}},
-		{"value and directory", Request{ServiceID: "app-one", Configuration: map[string]string{"AppCustom": "x", "AppCustom/Limit": "2"}}},
-		{"foreign device", Request{ServiceID: "app-one", Configuration: map[string]string{"AppCustom/Limit": "2"}, Devices: []dtos.Device{{Name: "foreign", ServiceName: "device-two"}}}},
+		{"full gateway path", Request{ServiceID: "app-one", Configuration: map[string]any{"edgex/v4/app-one/AppCustom/Limit": "2"}}},
+		{"unknown section", Request{ServiceID: "app-one", Configuration: map[string]any{"Other/Limit": "2"}}},
+		{"unknown nested field", Request{ServiceID: "app-one", Configuration: map[string]any{"AppCustom/Limit": "2", "AppCustom/Typo": "1"}}},
+		{"invalid type", Request{ServiceID: "app-one", Configuration: map[string]any{"AppCustom/Limit": "secret-value"}}},
+		{"deleted required value", Request{ServiceID: "app-one", Configuration: map[string]any{}}},
+		{"value and directory", Request{ServiceID: "app-one", Configuration: map[string]any{"AppCustom": "x", "AppCustom/Limit": "2"}}},
+		{"foreign device", Request{ServiceID: "app-one", Configuration: map[string]any{"AppCustom/Limit": "2"}, Devices: []dtos.Device{{Name: "foreign", ServiceName: "device-two"}}}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -88,8 +88,8 @@ func TestRejectInvalidOrForeignConfiguration(t *testing.T) {
 func TestLoadedConfigRequiresExplicitRegistration(t *testing.T) {
 	r := New("app-one")
 	require.NoError(t, r.RequireValidator(&customConfig{}))
-	require.False(t, r.Validate(Request{ServiceID: "app-one", Configuration: map[string]string{"AppCustom/Limit": "1"}}).Valid)
-	require.False(t, r.Validate(Request{ServiceID: "app-one", Configuration: map[string]string{}}).Valid, "missing validators must not be hidden by deleting their section")
+	require.False(t, r.Validate(Request{ServiceID: "app-one", Configuration: map[string]any{"AppCustom/Limit": "1"}}).Valid)
+	require.False(t, r.Validate(Request{ServiceID: "app-one", Configuration: map[string]any{}}).Valid, "missing validators must not be hidden by deleting their section")
 	response := httptest.NewRecorder()
 	r.ServeHTTP(response, httptest.NewRequest(http.MethodGet, Route, nil))
 	require.Contains(t, response.Body.String(), "AppCustom")
@@ -125,10 +125,10 @@ func TestDeviceValidatorOnlyReceivesOwnedDevices(t *testing.T) {
 		require.Equal(t, "device-one", devices[0].ServiceName)
 		return fmt.Errorf("invalid protocol")
 	})
-	result := r.Validate(Request{ServiceID: "device-one", Configuration: map[string]string{}, Devices: []dtos.Device{{Name: "one", ServiceName: "device-one"}}})
+	result := r.Validate(Request{ServiceID: "device-one", Configuration: map[string]any{}, Devices: []dtos.Device{{Name: "one", ServiceName: "device-one"}}})
 	require.False(t, result.Valid)
 	require.Equal(t, 1, calls)
-	result = r.Validate(Request{ServiceID: "device-one", Configuration: map[string]string{}, Devices: []dtos.Device{{Name: "two", ServiceName: "device-two"}}})
+	result = r.Validate(Request{ServiceID: "device-one", Configuration: map[string]any{}, Devices: []dtos.Device{{Name: "two", ServiceName: "device-two"}}})
 	require.False(t, result.Valid)
 	require.Equal(t, 1, calls)
 }
@@ -149,7 +149,7 @@ func TestExplicitRegistrationUsesExistingValidator(t *testing.T) {
 	r := New("app-one")
 	live := &customConfig{AppCustom: customSettings{Limit: 99}}
 	require.NoError(t, r.RequireValidator(live))
-	request := Request{ServiceID: "app-one", Configuration: map[string]string{"AppCustom/Limit": "2"}}
+	request := Request{ServiceID: "app-one", Configuration: map[string]any{"AppCustom/Limit": "2"}}
 	require.False(t, r.Validate(request).Valid, "loading a type with Validate must not register it")
 	calls := 0
 	require.NoError(t, r.Register(func() any { return &customConfig{} }, func(candidate any) error {
@@ -175,7 +175,7 @@ func TestRegisterCustomCreatesFreshCandidates(t *testing.T) {
 		candidates = append(candidates, candidate)
 		return candidate.Validate()
 	}))
-	request := Request{ServiceID: "app-one", Configuration: map[string]string{"AppCustom/Limit": "2", "AppCustom/LegacyEntries/one": "4"}}
+	request := Request{ServiceID: "app-one", Configuration: map[string]any{"AppCustom/Limit": "2", "AppCustom/LegacyEntries/one": "4"}}
 	require.True(t, r.Validate(request).Valid)
 	require.True(t, r.Validate(request).Valid)
 	require.Len(t, candidates, 2)
@@ -186,7 +186,7 @@ func TestRegisterCustomCreatesFreshCandidates(t *testing.T) {
 	require.Equal(t, 99, prototype.AppCustom.Limit)
 	require.Equal(t, map[string]int{"live": 7}, prototype.AppCustom.Entries)
 	// Deleting required settings must not inherit values from the prototype.
-	require.False(t, r.Validate(Request{ServiceID: "app-one", Configuration: map[string]string{}}).Valid)
+	require.False(t, r.Validate(Request{ServiceID: "app-one", Configuration: map[string]any{}}).Valid)
 }
 
 func TestRegisterCustomRejectsInvalidRegistration(t *testing.T) {
@@ -215,4 +215,27 @@ func TestRegisterCustomRejectsInvalidRegistration(t *testing.T) {
 	r := New("app-one")
 	require.NoError(t, r.RegisterCustom(&customConfig{}, "AppCustom", validate))
 	require.Error(t, r.RegisterCustom(&customConfig{}, "AppCustom", validate))
+}
+
+func TestCapabilitiesDistinguishStandardAndPrivateSections(t *testing.T) {
+	r := New("service-one")
+	type standard struct {
+		Service  struct{ Host string }
+		Writable struct{ LogLevel string }
+	}
+	require.NoError(t, r.RegisterStandard(func() any { return &standard{} }, func(any) error { return nil }))
+	require.NoError(t, r.RegisterCustom(&customConfig{}, "AppCustom", func(any) error { return nil }))
+	require.NoError(t, r.Register(func() any { return &struct{ Other struct{ Value string } }{} }, func(any) error { return nil }))
+	require.NoError(t, r.RequireValidator(&struct{ Unregistered struct{ Value string } }{}))
+	response := httptest.NewRecorder()
+	r.ServeHTTP(response, httptest.NewRequest(http.MethodGet, Route, nil))
+	var capabilities Capabilities
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &capabilities))
+	require.Equal(t, []string{"AppCustom", "Other", "Service", "Unregistered", "Writable"}, capabilities.Sections)
+	require.Equal(t, []string{"Service", "Writable"}, capabilities.SharedSections)
+	// Filtering common custom settings must never hide a loaded custom section's
+	// missing validator, even when the resulting candidate has no custom keys.
+	result := r.Validate(Request{ServiceID: "service-one", Configuration: map[string]any{"Service/Host": "localhost"}})
+	require.False(t, result.Valid)
+	require.Equal(t, []Issue{{Path: "Unregistered", Message: "configuration validator is not registered"}}, result.Errors)
 }
