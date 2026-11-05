@@ -133,3 +133,22 @@ func TestInitializedCapabilitiesShareOnlyStandardConfiguration(t *testing.T) {
 		require.Contains(t, capabilities.SharedSections, section)
 	}
 }
+
+func TestConfigPreflightQueueBatchSize(t *testing.T) {
+	sdk, _ := createSdkAndRouter()
+	sdk.serviceKey = "test-service"
+	require.NoError(t, sdk.initializeConfigValidation())
+	for _, tc := range []struct {
+		value string
+		valid bool
+	}{{"0", true}, {"1", true}, {"100", true}, {"1000", true}, {"-1", false}, {"1001", false}, {"1.5", false}, {"abc", false}} {
+		t.Run(tc.value, func(t *testing.T) {
+			result := sdk.configValidation.Validate(configvalidation.Request{ServiceID: "test-service", Configuration: map[string]any{
+				"Service/Host": "localhost", "Service/Port": "59701", "Service/RequestTimeout": "5s",
+				"Writable/LogLevel": "INFO", "Trigger/Type": "http",
+				"Writable/StoreAndForward/MaxBatchItems": tc.value,
+			}})
+			require.Equal(t, tc.valid, result.Valid, "%+v", result.Errors)
+		})
+	}
+}

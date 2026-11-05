@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"sync"
 
 	bootstrapConfig "github.com/edgexfoundry/go-mod-bootstrap/v4/config"
 
@@ -25,13 +24,12 @@ import (
 
 const defaultDBName = "edgex_db"
 
-var once sync.Once
-var dc *Client
-
 type Client struct {
 	connPool      *pgxpool.Pool
 	loggingClient logger.LoggingClient
 	appServiceKey string
+	freeSpace     func(string) (uint64, error)
+	retention     *retentionRegistry
 }
 
 // NewClient returns a pointer to the Postgres client
@@ -43,23 +41,24 @@ func NewClient(ctx context.Context, config bootstrapConfig.Database, credentials
 		databaseName = defaultDBName
 	}
 
-	var edgeXerr errors.EdgeX
-	once.Do(func() {
-		// use url encode to prevent special characters in the connection string
-		connectionStr := "postgres://" + fmt.Sprintf("%s:%s@%s:%d/%s", url.PathEscape(credentials.Username), url.PathEscape(credentials.Password), url.PathEscape(config.Host), config.Port, url.PathEscape(databaseName))
-		dbPool, err := pgxpool.New(ctx, connectionStr)
-		if err != nil {
-			edgeXerr = wrapDBError("fail to create pg connection pool", err)
+	// Each initialization attempt owns its pool. The SDK retains successful
+	// clients; a failed attempt must not cache closed pools or old credentials.
+	connectionStr := "postgres://" + fmt.Sprintf("%s:%s@%s:%d/%s", url.PathEscape(credentials.Username), url.PathEscape(credentials.Password), url.PathEscape(config.Host), config.Port, url.PathEscape(databaseName))
+	dbPool, err := pgxpool.New(ctx, connectionStr)
+	if err != nil {
+		return nil, wrapDBError("fail to create pg connection pool", err)
+	}
+	initialized := false
+	defer func() {
+		if !initialized {
+			dbPool.Close()
 		}
-
-		dc = &Client{
-			connPool:      dbPool,
-			loggingClient: lc,
-			appServiceKey: serviceKey,
-		}
-	})
-	if edgeXerr != nil {
-		return nil, errors.NewCommonEdgeX(errors.KindDatabaseError, "failed to create a Postgres client", edgeXerr)
+	}()
+	dc := &Client{
+		connPool:      dbPool,
+		loggingClient: lc,
+		appServiceKey: serviceKey,
+		retention:     newRetentionRegistry(),
 	}
 
 	// invoke Ping to test the connectivity to the DB
@@ -80,6 +79,7 @@ func NewClient(ctx context.Context, config bootstrapConfig.Database, credentials
 
 	lc.Info("Successfully connected to Postgres database")
 
+	initialized = true
 	return dc, nil
 }
 

@@ -2,6 +2,12 @@ module github.com/edgexfoundry/app-functions-sdk-go/v4
 
 go 1.25.0
 
+// Local development: the live configuration fix also requires this bootstrap patch.
+// Replace with a released bootstrap version before publishing the SDK.
+replace (
+	github.com/edgexfoundry/go-mod-bootstrap/v4 => ../go-mod-bootstrap
+)
+
 require (
 	github.com/blang/semver/v4 v4.0.0
 	github.com/diegoholiveira/jsonlogic/v3 v3.10.1
@@ -22,6 +28,7 @@ require (
 	github.com/rcrowley/go-metrics v0.0.0-20250401214520-65e299d6c5c9
 	github.com/spf13/cast v1.10.0
 	github.com/stretchr/testify v1.11.1
+	golang.org/x/sys v0.46.0
 )
 
 require (
@@ -130,7 +137,6 @@ require (
 	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/term v0.44.0 // indirect
 	golang.org/x/text v0.38.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251202230838-ff82c1b0f217 // indirect

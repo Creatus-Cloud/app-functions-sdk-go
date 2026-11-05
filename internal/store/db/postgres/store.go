@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/internal/store/db/models"
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/pkg/interfaces"
@@ -28,44 +29,13 @@ const (
 
 // getFullStoreTableName returns the table name with schema as prefix
 func (c Client) getFullStoreTableName() string {
-	return fmt.Sprintf(`"%s".%s`, c.appServiceKey, storeTableName)
+	return pgx.Identifier{c.appServiceKey, storeTableName}.Sanitize()
 }
 
 // Store persists a stored object to the store table and returns the assigned UUID
 func (c Client) Store(o interfaces.StoredObject) (string, error) {
-	err := o.ValidateContract(false)
-	if err != nil {
-		return "", err
-	}
-
-	var exists bool
-	ctx := context.Background()
-
-	fullTableName := c.getFullStoreTableName()
-	err = c.connPool.QueryRow(ctx, sqlCheckExistsById(fullTableName), o.ID).Scan(&exists)
-	if err != nil {
-		return "", wrapDBError("failed to query app svc store record job by id", err)
-	}
-
-	var model models.StoredObject
-	model.FromContract(o)
-
-	jsonBytes, err := model.MarshalJSON()
-	if err != nil {
-		return "", err
-	}
-
-	_, err = c.connPool.Exec(
-		ctx,
-		sqlInsertContent(fullTableName),
-		model.ID,
-		jsonBytes,
-	)
-	if err != nil {
-		return "", wrapDBError("failed to insert app svc store record", err)
-	}
-
-	return model.ID, nil
+	id, _, err := c.StoreWithLimits(o, interfaces.QueueLimits{})
+	return id, err
 }
 
 // RetrieveFromStore gets an object from the table with content column contains the appServiceKey
@@ -75,7 +45,8 @@ func (c Client) RetrieveFromStore(appServiceKey string) ([]interfaces.StoredObje
 		return nil, errors.NewCommonEdgeX(errors.KindContractInvalid, "no AppServiceKey provided", nil)
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
 	queryObj := map[string]any{appServiceKeyField: appServiceKey}
 	queryBytes, err := json.Marshal(queryObj)
@@ -109,48 +80,14 @@ func (c Client) RetrieveFromStore(appServiceKey string) ([]interfaces.StoredObje
 
 // Update replaces the data currently in the store table by the StoredObject ID
 func (c Client) Update(o interfaces.StoredObject) error {
-	err := o.ValidateContract(true)
-	if err != nil {
-		return err
-	}
-
-	var update models.StoredObject
-	update.FromContract(o)
-	json, err := update.MarshalJSON()
-	if err != nil {
-		return err
-	}
-
-	_, err = c.connPool.Exec(
-		context.Background(),
-		sqlUpdateContentById(c.getFullStoreTableName()),
-		json,
-		o.ID,
-	)
-	if err != nil {
-		return wrapDBError(fmt.Sprintf("failed to update app svc store record with id '%s'", o.ID), err)
-	}
-
-	return nil
+	_, err := c.UpdateWithLimits(o, interfaces.QueueLimits{})
+	return err
 }
 
 // RemoveFromStore removes an object from the store table by StoredObject ID
 func (c Client) RemoveFromStore(o interfaces.StoredObject) error {
-	err := o.ValidateContract(true)
-	if err != nil {
-		return err
-	}
-
-	_, err = c.connPool.Exec(
-		context.Background(),
-		sqlDeleteById(c.getFullStoreTableName()),
-		o.ID,
-	)
-	if err != nil {
-		return wrapDBError(fmt.Sprintf("failed to delete app svc store record with id '%s'", o.ID), err)
-	}
-
-	return nil
+	_, err := c.RemoveFromStoreBatch([]interfaces.StoredObject{o}, interfaces.QueueLimits{})
+	return err
 }
 
 // Disconnect ends the connection.

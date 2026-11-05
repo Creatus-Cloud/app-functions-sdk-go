@@ -357,9 +357,10 @@ func (fpr *FunctionsPipelineRuntime) StartStoreAndForward(
 	appCtx context.Context,
 	enabledWg *sync.WaitGroup,
 	enabledCtx context.Context,
-	serviceKey string) {
+	serviceKey string,
+	retryInterval string) {
 
-	fpr.storeForward.startStoreAndForwardRetryLoop(appWg, appCtx, enabledWg, enabledCtx, serviceKey)
+	fpr.storeForward.startStoreAndForwardRetryLoop(appWg, appCtx, enabledWg, enabledCtx, serviceKey, retryInterval)
 }
 
 func (fpr *FunctionsPipelineRuntime) processEventPayload(envelope types.MessageEnvelope) (*dtos.Event, error) {

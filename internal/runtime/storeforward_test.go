@@ -17,6 +17,7 @@
 package runtime
 
 import (
+	"context"
 	"errors"
 	"os"
 	"testing"
@@ -71,6 +72,30 @@ func TestMain(m *testing.M) {
 	})
 
 	os.Exit(m.Run())
+}
+
+func TestRetryWithoutInitializedStoreCanRecover(t *testing.T) {
+	cfg := &common.ConfigurationStruct{Writable: common.WritableInfo{
+		StoreAndForward: common.StoreAndForwardInfo{Enabled: true},
+	}}
+	services := di.NewContainer(di.ServiceConstructorMap{
+		container.ConfigurationName:                   func(di.Get) any { return cfg },
+		bootstrapContainer.LoggingClientInterfaceName: func(di.Get) any { return logger.NewMockClient() },
+	})
+	sf := NewFunctionPipelineRuntime("initializing", nil, services).storeForward
+	sf.dataCount.Inc(1)
+	require.NotPanics(t, sf.triggerRetry)
+	require.False(t, sf.retryInProgress.Load(), "unavailable store must not leave retries locked")
+	count, err := sf.queueCount(nil, "initializing")
+	require.ErrorContains(t, err, "not initialized")
+	require.Zero(t, count)
+	require.EqualValues(t, 1, sf.dataCount.Count(), "unavailable store must not discard the known count")
+
+	store := &mocks.StoreClient{}
+	store.On("RetrieveFromStore", "initializing").Return([]interfaces.StoredObject{}, nil).Once()
+	services.Update(di.ServiceConstructorMap{container.StoreClientName: func(di.Get) any { return store }})
+	sf.triggerRetry()
+	store.AssertExpectations(t)
 }
 
 func TestProcessRetryItems(t *testing.T) {
@@ -147,7 +172,7 @@ func TestProcessRetryItems(t *testing.T) {
 			storedObject := interfaces.NewStoredObject("dummy", []byte(test.ExpectedPayload), pipeline.Id, 2, version, contextData)
 			storedObject.RetryCount = test.RetryCount
 
-			removes, updates := runtime.storeForward.processRetryItems([]interfaces.StoredObject{storedObject})
+			removes, updates := runtime.storeForward.processRetryItems(context.Background(), []interfaces.StoredObject{storedObject})
 			assert.Equal(t, test.TargetTransformWasCalled, targetTransformWasCalled, "Target transform not called")
 			if test.RetryCount != test.ExpectedRetryCount {
 				if assert.True(t, len(updates) > 0, "Remove count not as expected") {

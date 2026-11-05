@@ -52,6 +52,26 @@ func (svc *Service) RegisterCustomStoreFactory(name string, factory func(cfg boo
 	return nil
 }
 
+// RegisterStoreForwardRetention configures independent queue items before Run.
+func (svc *Service) RegisterStoreForwardRetention(pipelineID string, split interfaces.RetryDataSplitter) error {
+	svc.storeForwardMu.Lock()
+	defer svc.storeForwardMu.Unlock()
+	if svc.storeForwardReady || svc.stopHandler() != nil {
+		return fmt.Errorf("StoreAndForward retention must be registered before Run")
+	}
+	if split == nil || svc.runtime == nil || svc.runtime.GetPipelineById(pipelineID) == nil {
+		return fmt.Errorf("StoreAndForward retention requires an existing pipeline and a splitter")
+	}
+	if svc.storeForwardRetention == nil {
+		svc.storeForwardRetention = make(map[string]interfaces.RetryDataSplitter)
+	}
+	if _, exists := svc.storeForwardRetention[pipelineID]; exists {
+		return fmt.Errorf("StoreAndForward retention already registered for pipeline %s", pipelineID)
+	}
+	svc.storeForwardRetention[pipelineID] = split
+	return nil
+}
+
 func (svc *Service) createStoreClient(database bootstrapConfig.Database, credentials bootstrapConfig.Credentials) (interfaces.StoreClient, error) {
 	switch strings.ToLower(database.Type) {
 	case db.RedisDB:
@@ -66,30 +86,109 @@ func (svc *Service) createStoreClient(database bootstrapConfig.Database, credent
 	}
 }
 
-func (svc *Service) startStoreForward() {
+// All store initialization and loop transitions share a lock with Run. Capture
+// startup settings inside it so startup cannot apply an older snapshot after
+// the listener has already finished processing a newer configuration.
+func (svc *Service) prepareStoreForwardStore() error {
+	svc.storeForwardMu.Lock()
+	defer svc.storeForwardMu.Unlock()
+	// Bootstrap starts the config listener before the application registers
+	// pipelines and retention. Only Run may open this initialization gate.
+	svc.storeForwardReady = true
+	return initializeStoreClient(svc.config.GetStoreAndForwardInfo(), svc)
+}
+
+func (svc *Service) applyCurrentStoreForwardSettings() error {
+	svc.storeForwardMu.Lock()
+	defer svc.storeForwardMu.Unlock()
+	return svc.applyStoreForwardSettingsLocked(svc.config.GetStoreAndForwardInfo())
+}
+
+func (svc *Service) applyStoreForwardSettings(settings common.StoreAndForwardInfo, revision uint64) error {
+	svc.storeForwardMu.Lock()
+	defer svc.storeForwardMu.Unlock()
+	err := svc.applyStoreForwardSettingsLocked(settings)
+	// Roll back before releasing the lifecycle lock: startup must not recover
+	// this same enable and then have its successful initialization rolled back.
+	if err != nil && svc.ctx.appCtx.Err() == nil {
+		if !svc.config.DisableStoreAndForwardIfRevision(revision) {
+			svc.lc.Debug("Preserving newer configuration after Store and Forward initialization failed")
+		}
+	}
+	return err
+}
+
+func (svc *Service) applyStoreForwardSettingsLocked(settings common.StoreAndForwardInfo) error {
+	if err := svc.ctx.appCtx.Err(); err != nil {
+		return err
+	}
+	if !svc.storeForwardReady {
+		return nil
+	}
+	if !settings.Enabled {
+		svc.stopStoreForwardLocked()
+		return nil
+	}
+	// Validate reused clients on every reload, even when the retry timer stays
+	// unchanged. Rejecting new limits must also stop an existing retry loop.
+	if err := initializeStoreClient(settings, svc); err != nil {
+		svc.stopStoreForwardLocked()
+		return err
+	}
+	if svc.ctx.storeForwardCancelCtx != nil {
+		if svc.storeForwardRetryInterval == settings.RetryInterval {
+			return nil
+		}
+		if interval, err := time.ParseDuration(settings.RetryInterval); err != nil || interval <= 0 {
+			svc.lc.Error("invalid StoreAndForward RetryInterval; keeping the current retry loop", "interval", settings.RetryInterval)
+			return nil
+		}
+		svc.stopStoreForwardLocked()
+	}
+	if err := svc.ctx.appCtx.Err(); err != nil {
+		return err
+	}
+
 	var storeForwardEnabledCtx context.Context
 	svc.ctx.storeForwardWg = &sync.WaitGroup{}
-	storeForwardEnabledCtx, svc.ctx.storeForwardCancelCtx = context.WithCancel(context.Background())
-	svc.runtime.StartStoreAndForward(svc.ctx.appWg, svc.ctx.appCtx, svc.ctx.storeForwardWg, storeForwardEnabledCtx, svc.serviceKey)
+	storeForwardEnabledCtx, svc.ctx.storeForwardCancelCtx = context.WithCancel(svc.ctx.appCtx)
+	svc.storeForwardRetryInterval = settings.RetryInterval
+	svc.runtime.StartStoreAndForward(svc.ctx.appWg, svc.ctx.appCtx, svc.ctx.storeForwardWg, storeForwardEnabledCtx, svc.serviceKey, settings.RetryInterval)
+	return nil
 }
 
 func (svc *Service) stopStoreForward() {
-	svc.lc.Info("Canceling Store and Forward retry loop")
-	if svc.ctx.storeForwardCancelCtx != nil {
-		svc.ctx.storeForwardCancelCtx()
-	}
-	svc.ctx.storeForwardWg.Wait()
+	svc.storeForwardMu.Lock()
+	defer svc.storeForwardMu.Unlock()
+	svc.stopStoreForwardLocked()
 }
 
-func initializeStoreClient(config *common.ConfigurationStruct, svc *Service) error {
-	// Only need the database client if Store and Forward is enabled
-	if !config.GetWritableInfo().StoreAndForward.Enabled {
-		svc.dic.Update(di.ServiceConstructorMap{
-			container.StoreClientName: func(get di.Get) interface{} {
-				return nil
-			},
-		})
+func (svc *Service) stopStoreForwardLocked() {
+	if svc.ctx.storeForwardCancelCtx != nil {
+		svc.lc.Info("Canceling Store and Forward retry loop")
+		svc.ctx.storeForwardCancelCtx()
+	}
+	if svc.ctx.storeForwardWg != nil {
+		svc.ctx.storeForwardWg.Wait()
+	}
+	svc.ctx.storeForwardCancelCtx = nil
+	svc.storeForwardRetryInterval = ""
+}
+
+// Caller holds storeForwardMu. Reuse a client initialized by the other startup
+// path; disabling retries must not erase it from the dependency container.
+func initializeStoreClient(settings common.StoreAndForwardInfo, svc *Service) error {
+	if err := svc.ctx.appCtx.Err(); err != nil {
+		return err
+	}
+	if !settings.Enabled {
 		return nil
+	}
+	if store := container.StoreClientFrom(svc.dic.Get); store != nil {
+		return settings.ValidateQueueStore(store)
+	}
+	if _, err := settings.QueueLimits(); err != nil {
+		return err
 	}
 
 	logger := bootstrapContainer.LoggingClientFrom(svc.dic.Get)
@@ -97,7 +196,11 @@ func initializeStoreClient(config *common.ConfigurationStruct, svc *Service) err
 
 	var err error
 
-	secrets, err := secretProvider.GetSecret(config.Database.Type)
+	database := svc.config.Database
+	secrets, err := secretProvider.GetSecret(database.Type)
+	if cancelErr := svc.ctx.appCtx.Err(); cancelErr != nil {
+		return cancelErr
+	}
 	if err != nil {
 		return fmt.Errorf("unable to get Database Credentials for Store and Forward: %s", err.Error())
 	}
@@ -113,9 +216,16 @@ func initializeStoreClient(config *common.ConfigurationStruct, svc *Service) err
 
 	var storeClient interfaces.StoreClient
 	for time.Now().Before(tryUntil) {
-		if storeClient, err = svc.createStoreClient(config.Database, credentials); err != nil {
-			logger.Warnf("unable to initialize Database '%s' for Store and Forward: %s", config.Database.Type, err.Error())
-			time.Sleep(time.Duration(startup.Interval) * time.Second)
+		if cancelErr := svc.ctx.appCtx.Err(); cancelErr != nil {
+			return cancelErr
+		}
+		if storeClient, err = svc.createStoreClient(database, credentials); err != nil {
+			logger.Warnf("unable to initialize Database '%s' for Store and Forward: %s", database.Type, err.Error())
+			select {
+			case <-svc.ctx.appCtx.Done():
+				return svc.ctx.appCtx.Err()
+			case <-time.After(time.Duration(startup.Interval) * time.Second):
+			}
 			continue
 		}
 		break
@@ -124,7 +234,37 @@ func initializeStoreClient(config *common.ConfigurationStruct, svc *Service) err
 	if err != nil {
 		return fmt.Errorf("initialize Database for Store and Forward failed: %s", err.Error())
 	}
+	if storeClient == nil {
+		return fmt.Errorf("initialize Database for Store and Forward returned no client")
+	}
+	if cancelErr := svc.ctx.appCtx.Err(); cancelErr != nil {
+		_ = storeClient.Disconnect()
+		return cancelErr
+	}
 
+	if err := settings.ValidateQueueStore(storeClient); err != nil {
+		_ = storeClient.Disconnect()
+		return err
+	}
+	for pipelineID, split := range svc.storeForwardRetention {
+		retained, ok := storeClient.(interfaces.RetentionStoreClient)
+		if !ok {
+			_ = storeClient.Disconnect()
+			return fmt.Errorf("StoreAndForward keyed retention requires PostgreSQL")
+		}
+		queueLimits, err := settings.QueueLimits()
+		if err == nil {
+			err = retained.ConfigureRetention(svc.ctx.appCtx, pipelineID, split, queueLimits)
+		}
+		if err != nil {
+			_ = storeClient.Disconnect()
+			return fmt.Errorf("prepare StoreAndForward retention for %s: %w", pipelineID, err)
+		}
+	}
+	if cancelErr := svc.ctx.appCtx.Err(); cancelErr != nil {
+		_ = storeClient.Disconnect()
+		return cancelErr
+	}
 	svc.dic.Update(di.ServiceConstructorMap{
 		container.StoreClientName: func(get di.Get) interface{} {
 			return storeClient

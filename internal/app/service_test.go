@@ -49,6 +49,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
+	gometrics "github.com/rcrowley/go-metrics"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -61,6 +62,9 @@ var baseUrl = "http://localhost:"
 var mockSecretProvider bootstrapInterfaces.SecretProvider
 
 func TestMain(m *testing.M) {
+	// The process-wide meter worker waits on a real-time ticker. Start it
+	// outside any synctest bubble so isolated listener tests can quiesce.
+	gometrics.NewMeter().Stop()
 	// No remote and no file results in STDOUT logging only
 	lc = logger.NewClient("test", "DEBUG")
 	mockMetricsManager := &mocks.MetricsManager{}
@@ -586,11 +590,13 @@ func TestLoadConfigurableFunctionPipelinesDefaultNotFound(t *testing.T) {
 			err := service.config.SetWritableInfo("Pipeline.ExecutionOrder", test.defaultExecutionOrder)
 			assert.NoError(t, err)
 			if len(test.perTopicExecutionOrder) > 0 {
-				service.config.GetWritableInfo().Pipeline.PerTopicPipelines["bogus"] = common.TopicPipeline{
+				pipelines := service.config.GetWritableInfo().Pipeline.PerTopicPipelines
+				pipelines["bogus"] = common.TopicPipeline{
 					Id:             "bogus",
 					Topics:         "#",
 					ExecutionOrder: test.perTopicExecutionOrder,
 				}
+				require.NoError(t, service.config.SetWritableInfo("Pipeline.PerTopicPipelines", pipelines))
 			}
 
 			appFunctions, err := service.LoadConfigurableFunctionPipelines()
@@ -852,7 +858,7 @@ func TestStop(t *testing.T) {
 	sdk.Stop()
 	require.True(t, stopCalled, "Cancel function set at svc.stop should be called if set")
 
-	sdk.ctx.stop = nil
+	sdk.setStopHandler(nil)
 	sdk.Stop() //should avoid nil pointer
 }
 

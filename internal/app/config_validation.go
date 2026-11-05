@@ -31,6 +31,9 @@ func (svc *Service) initializeConfigValidation() error {
 				return err
 			}
 		}
+		if _, err := c.Writable.StoreAndForward.QueueLimits(); err != nil {
+			return err
+		}
 		if c.Writable.StoreAndForward.Enabled {
 			d, err := time.ParseDuration(c.Writable.StoreAndForward.RetryInterval)
 			if err != nil || d <= 0 {

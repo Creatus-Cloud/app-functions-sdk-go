@@ -21,10 +21,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/edgexfoundry/app-functions-sdk-go/v4/internal/bootstrap/container"
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/internal/common"
 	"github.com/edgexfoundry/go-mod-bootstrap/v4/bootstrap/config"
-	coreCommon "github.com/edgexfoundry/go-mod-core-contracts/v4/common"
 )
 
 // ConfigUpdateProcessor contains the data need to process configuration updates
@@ -43,17 +41,15 @@ func NewConfigUpdateProcessor(svc *Service) *ConfigUpdateProcessor {
 func (processor *ConfigUpdateProcessor) WaitForConfigUpdates(configUpdated config.UpdatedStream) {
 	svc := processor.svc
 	svc.ctx.appWg.Add(1)
+	// Capture the baseline before returning to bootstrap so the first update
+	// cannot become the baseline before the listener goroutine starts.
+	svc.config.SetPipelineFunctionParameterNamesLowercase()
+	previousWritable := svc.config.CopyWritableInfo()
 
 	go func() {
 		defer svc.ctx.appWg.Done()
 		lc := svc.LoggingClient()
 		lc.Info("Waiting for App Service configuration updates...")
-
-		// set pipeline function parameter names to lowercase to avoid casing issues from what is in source configuration
-		svc.config.SetPipelineFunctionParameterNamesLowercase()
-
-		var previousWritable common.WritableInfo
-		previousWritable = svc.config.CopyWritableInfo()
 
 		for {
 			select {
@@ -61,86 +57,61 @@ func (processor *ConfigUpdateProcessor) WaitForConfigUpdates(configUpdated confi
 				lc.Info("Exiting waiting for App Service configuration updates")
 				return
 
-			case <-configUpdated:
+			case _, ok := <-configUpdated:
+				if !ok {
+					return
+				}
 				// set pipeline function parameter names to lowercase to avoid casing issues from what is in source configuration
 				svc.config.SetPipelineFunctionParameterNamesLowercase()
-				currentWritable := svc.config.GetWritableInfo()
+				currentWritable, revision := svc.config.GetWritableInfoWithRevision()
 				lc.Info("Processing App Service configuration updates")
 
-				// Note: Updates occur one setting at a time so only have to look for single changes
-				switch {
-				case previousWritable.StoreAndForward.MaxRetryCount != currentWritable.StoreAndForward.MaxRetryCount:
-					if currentWritable.StoreAndForward.MaxRetryCount < 0 {
-						lc.Warn("StoreAndForward MaxRetryCount can not be less than 0, defaulting to 1")
-						currentWritable.StoreAndForward.MaxRetryCount = 1
-					}
-					lc.Infof("StoreAndForward MaxRetryCount changed to %d", currentWritable.StoreAndForward.MaxRetryCount)
+				currentWritable = processor.processConfigChanges(previousWritable, currentWritable, revision)
 
-				case previousWritable.StoreAndForward.RetryInterval != currentWritable.StoreAndForward.RetryInterval:
-					if _, err := time.ParseDuration(currentWritable.StoreAndForward.RetryInterval); err != nil {
-						lc.Errorf("StoreAndForward RetryInterval not change: %s", err.Error())
-						currentWritable.StoreAndForward.RetryInterval = previousWritable.StoreAndForward.RetryInterval
-						continue
-					}
-
-					processor.processConfigChangedStoreForwardRetryInterval()
-					lc.Infof("StoreAndForward RetryInterval changed to %s", currentWritable.StoreAndForward.RetryInterval)
-
-				case previousWritable.StoreAndForward.Enabled != currentWritable.StoreAndForward.Enabled:
-					processor.processConfigChangedStoreForwardEnabled()
-					lc.Infof("StoreAndForward Enabled changed to %v", currentWritable.StoreAndForward.Enabled)
-
-				case !reflect.DeepEqual(previousWritable.Pipeline, currentWritable.Pipeline):
-					processor.processConfigChangedPipeline()
-
-				default:
-					lc.Info("No configuration changes detected that need special processing")
-				}
-
-				// grab new copy of the writeable configuration for comparing against when next update occurs
-				previousWritable = svc.config.CopyWritableInfo()
+				// A later reload may already be published. Compare the next signal
+				// against the snapshot processed here, not that newer configuration.
+				previousWritable = currentWritable
 			}
 		}
 	}()
 }
 
-func (processor *ConfigUpdateProcessor) processConfigChangedStoreForwardRetryInterval() {
+func (processor *ConfigUpdateProcessor) processConfigChanges(previous, current common.WritableInfo, revision uint64) common.WritableInfo {
 	sdk := processor.svc
-
-	if sdk.config.GetWritableInfo().StoreAndForward.Enabled {
-		sdk.stopStoreForward()
-		sdk.startStoreForward()
+	lc := sdk.LoggingClient()
+	if previous.StoreAndForward.MaxRetryCount != current.StoreAndForward.MaxRetryCount {
+		lc.Infof("StoreAndForward MaxRetryCount changed to %d", current.StoreAndForward.MaxRetryCount)
 	}
-}
 
-func (processor *ConfigUpdateProcessor) processConfigChangedStoreForwardEnabled() {
-	sdk := processor.svc
-
-	if sdk.config.GetWritableInfo().StoreAndForward.Enabled {
-		storeClient := container.StoreClientFrom(sdk.dic.Get)
-		// StoreClient must be set up for StoreAndForward
-		if storeClient == nil {
-			err := initializeStoreClient(sdk.config, sdk)
-			if err != nil {
-				sdk.lc.Errorf("Initializing Database for Store and Forward failed: %v", err)
-				if err := sdk.config.SetWritableInfo("StoreAndForward.Enabled", coreCommon.ValueFalse); err != nil {
-					sdk.lc.Errorf("Failed to set Store and Forward to %s: %v", coreCommon.ValueFalse, err)
-				}
-				return
-			}
+	// Startup can also apply settings, so reconcile against the actual loop on
+	// every notification, not just changes from the listener's own baseline.
+	enabledChanged := previous.StoreAndForward.Enabled != current.StoreAndForward.Enabled
+	if err := sdk.applyStoreForwardSettings(current.StoreAndForward, revision); err != nil {
+		if sdk.ctx.appCtx.Err() != nil {
+			return current
 		}
-
-		sdk.startStoreForward()
-	} else {
-		sdk.stopStoreForward()
+		lc.Errorf("Initializing Database for Store and Forward failed: %v", err)
+		current.StoreAndForward.Enabled = false
 	}
+	if enabledChanged {
+		lc.Infof("StoreAndForward Enabled changed to %v", current.StoreAndForward.Enabled)
+	} else if previous.StoreAndForward.RetryInterval != current.StoreAndForward.RetryInterval {
+		if interval, err := time.ParseDuration(current.StoreAndForward.RetryInterval); err == nil && interval > 0 {
+			lc.Infof("StoreAndForward RetryInterval changed to %s", current.StoreAndForward.RetryInterval)
+		}
+	}
+
+	if !reflect.DeepEqual(previous.Pipeline, current.Pipeline) {
+		processor.processConfigChangedPipeline(current.Pipeline)
+	}
+	return current
 }
 
-func (processor *ConfigUpdateProcessor) processConfigChangedPipeline() {
+func (processor *ConfigUpdateProcessor) processConfigChangedPipeline(settings common.PipelineInfo) {
 	sdk := processor.svc
 
 	if sdk.usingConfigurablePipeline {
-		pipelines, err := sdk.LoadConfigurableFunctionPipelines()
+		pipelines, err := sdk.loadConfigurableFunctionPipelines(settings)
 		if err != nil {
 			sdk.LoggingClient().Errorf("unable to reload Configurable Pipeline(s) from new configuration: %s: all pipelines have been disabled", err.Error())
 			// Clear the pipeline transforms so error occurs when attempting to execute the pipeline(s).

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/edgexfoundry/app-functions-sdk-go/v4/internal/runtime"
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/internal/store/db"
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/internal/store/db/redis"
 	"github.com/edgexfoundry/app-functions-sdk-go/v4/pkg/interfaces"
@@ -28,6 +29,20 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRegisterStoreForwardRetentionLifecycle(t *testing.T) {
+	svc := &Service{runtime: runtime.NewFunctionPipelineRuntime("retention-test", nil, dic)}
+	split := func(data []byte) ([]interfaces.RetainedPayload, error) {
+		return []interfaces.RetainedPayload{{Payload: data, RetentionKey: "key"}}, nil
+	}
+	require.Error(t, svc.RegisterStoreForwardRetention("missing", split))
+	svc.runtime.SetDefaultFunctionsPipeline([]interfaces.AppFunction{func(interfaces.AppFunctionContext, any) (bool, any) { return true, nil }})
+	require.Error(t, svc.RegisterStoreForwardRetention(interfaces.DefaultPipelineId, nil))
+	require.NoError(t, svc.RegisterStoreForwardRetention(interfaces.DefaultPipelineId, split))
+	require.Error(t, svc.RegisterStoreForwardRetention(interfaces.DefaultPipelineId, split))
+	svc.setStopHandler(func() {})
+	require.ErrorContains(t, svc.RegisterStoreForwardRetention(interfaces.DefaultPipelineId, split), "before Run")
+}
 
 func Test_service_RegisterCustomStoreFactory_Inbuilt_Name(t *testing.T) {
 	sut := &Service{}

@@ -96,11 +96,16 @@ type Service struct {
 	runtime                    *runtime.FunctionsPipelineRuntime
 	webserver                  *webserver.WebServer
 	ctx                        contextGroup
+	stopMu                     sync.RWMutex
 	deferredFunctions          []bootstrap.Deferred
 	backgroundPublishChannel   <-chan interfaces.BackgroundMessage
 	customTriggerMu            sync.RWMutex
 	customTriggerFactories     map[string]func(sdk *Service) (interfaces.Trigger, error)
 	customStoreClientFactories map[string]func(db bootstrapConfig.Database, cred bootstrapConfig.Credentials) (interfaces.StoreClient, error)
+	storeForwardRetention      map[string]interfaces.RetryDataSplitter
+	storeForwardMu             sync.Mutex
+	storeForwardReady          bool
+	storeForwardRetryInterval  string
 	profileSuffixPlaceholder   string
 	commandLine                commandLineFlags
 	flags                      *flags.Default
@@ -183,33 +188,57 @@ func (svc *Service) AddBackgroundPublisherWithTopic(capacity int, topic string) 
 	return pub, nil
 }
 
-// Stop will force the service loop to exit in the same fashion as SIGINT/SIGTERM received from the OS
+// Stop cancels initialization and the running service without waiting for Run
+// to reach its event loop. It is safe to call concurrently with shutdown.
 func (svc *Service) Stop() {
-	if svc.ctx.stop != nil {
-		svc.ctx.stop()
+	// Copy under the lock and invoke outside it: cleanup can clear the field,
+	// while an already captured CancelFunc remains safe and idempotent.
+	if stop := svc.stopHandler(); stop != nil {
+		stop()
 	} else {
 		svc.lc.Warn("Stop called but no stop handler set on SDK - is the service running?")
 	}
+}
+
+func (svc *Service) stopHandler() context.CancelFunc {
+	svc.stopMu.RLock()
+	defer svc.stopMu.RUnlock()
+	return svc.ctx.stop
+}
+
+func (svc *Service) setStopHandler(stop context.CancelFunc) {
+	svc.stopMu.Lock()
+	defer svc.stopMu.Unlock()
+	svc.ctx.stop = stop
 }
 
 // Run initializes and starts the trigger as specified in the
 // configuration. It will also configure the webserver and start listening on
 // the specified port.
 func (svc *Service) Run() error {
+	// Publish cancellation before any initialization can block. All startup
+	// work and background workers already observe this application context.
+	svc.setStopHandler(svc.ctx.appCancelCtx)
+	// Cancel initialization and retries before joining them. This also covers
+	// failures during startup, before a retry loop has been created.
+	defer func() {
+		svc.setStopHandler(nil)
+		svc.ctx.appCancelCtx()
+		svc.stopStoreForward()
+		svc.ctx.appWg.Wait()
+		for _, deferredFunc := range svc.deferredFunctions {
+			deferredFunc()
+		}
+	}()
 
-	config := container.ConfigurationFrom(svc.dic.Get)
-
-	err := initializeStoreClient(config, svc)
+	err := svc.prepareStoreForwardStore()
 	if err != nil {
 		return err
 	}
 
-	runCtx, stop := context.WithCancel(context.Background())
-
-	svc.ctx.stop = stop
-
-	httpErrors := make(chan error)
-	defer close(httpErrors)
+	// The server can report an error after an early startup failure. Leave its
+	// one-result channel open so that sender cannot panic or block on return.
+	httpErrors := make(chan error, 1)
 
 	svc.webserver.StartWebServer(httpErrors)
 
@@ -229,10 +258,8 @@ func (svc *Service) Run() error {
 	// deferred is a function that needs to be called when services exits.
 	svc.addDeferred(deferred)
 
-	if svc.config.GetWritableInfo().StoreAndForward.Enabled {
-		svc.startStoreForward()
-	} else {
-		svc.lc.Info("StoreAndForward disabled. Not running retry loop.")
+	if err := svc.applyCurrentStoreForwardSettings(); err != nil {
+		return err
 	}
 
 	svc.lc.Info(svc.config.Service.StartupMsg)
@@ -242,6 +269,7 @@ func (svc *Service) Run() error {
 
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
 
 	select {
 	case httpError := <-httpErrors:
@@ -251,23 +279,8 @@ func (svc *Service) Run() error {
 	case signalReceived := <-signals:
 		svc.lc.Info("Terminating signal received: " + signalReceived.String())
 
-	case <-runCtx.Done():
-		svc.lc.Info("Terminating: svc.Stop called")
-	}
-
-	svc.ctx.stop = nil
-
-	if svc.config.GetWritableInfo().StoreAndForward.Enabled {
-		svc.ctx.storeForwardCancelCtx()
-		svc.ctx.storeForwardWg.Wait()
-	}
-
-	svc.ctx.appCancelCtx() // Cancel all long-running go funcs
-	svc.ctx.appWg.Wait()
-	// Call all the deferred funcs that need to happen when exiting.
-	// These are things like un-register from the Registry, disconnect from the Message Bus, etc
-	for _, deferredFunc := range svc.deferredFunctions {
-		deferredFunc()
+	case <-svc.ctx.appCtx.Done():
+		svc.lc.Info("Terminating: application context canceled")
 	}
 
 	return err
@@ -275,13 +288,25 @@ func (svc *Service) Run() error {
 
 // LoadConfigurableFunctionPipelines return the configured function pipelines (default and per topic) from configuration.
 func (svc *Service) LoadConfigurableFunctionPipelines() (map[string]interfaces.FunctionPipeline, error) {
+	return svc.loadConfigurableFunctionPipelines(svc.config.GetWritableInfo().Pipeline)
+}
+
+func (svc *Service) loadConfigurableFunctionPipelines(pipelineConfig common.PipelineInfo) (map[string]interfaces.FunctionPipeline, error) {
 	pipelines := make(map[string]interfaces.FunctionPipeline)
 
 	svc.usingConfigurablePipeline = true
 
 	svc.targetType = nil
 
-	switch strings.ToLower(strings.TrimSpace(svc.config.GetWritableInfo().Pipeline.TargetType)) {
+	// Normalize the detached snapshot used to build these pipelines. Updating
+	// live configuration would no longer change this snapshot's parameter maps.
+	for _, function := range pipelineConfig.Functions {
+		for key, value := range function.Parameters {
+			delete(function.Parameters, key)
+			function.Parameters[strings.ToLower(key)] = value
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(pipelineConfig.TargetType)) {
 	case rawTargetType:
 		svc.targetType = &[]byte{}
 	case metricTargetType:
@@ -289,11 +314,10 @@ func (svc *Service) LoadConfigurableFunctionPipelines() (map[string]interfaces.F
 	case emptyTargetType, eventTargetType:
 		svc.targetType = &dtos.Event{}
 	default:
-		return nil, fmt.Errorf("pipline TargetType of '%s' is not supported", svc.config.GetWritableInfo().Pipeline.TargetType)
+		return nil, fmt.Errorf("pipline TargetType of '%s' is not supported", pipelineConfig.TargetType)
 	}
 
 	configurable := reflect.ValueOf(NewConfigurable(svc.lc, svc.SecretProvider()))
-	pipelineConfig := svc.config.GetWritableInfo().Pipeline
 
 	defaultExecutionOrder := strings.TrimSpace(pipelineConfig.ExecutionOrder)
 
@@ -347,9 +371,6 @@ func (svc *Service) loadConfigurablePipelineTransforms(
 	functions map[string]common.PipelineFunction,
 	configurable reflect.Value) ([]interfaces.AppFunction, error) {
 	var transforms []interfaces.AppFunction
-
-	// set pipeline function parameter names to lowercase to avoid casing issues from what is in source configuration
-	svc.config.SetPipelineFunctionParameterNamesLowercase()
 
 	for _, functionName := range executionOrder {
 		functionName = strings.TrimSpace(functionName)

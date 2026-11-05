@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 
+	bootstrapInterfaces "github.com/edgexfoundry/go-mod-bootstrap/v4/bootstrap/interfaces"
 	bootstrapUtils "github.com/edgexfoundry/go-mod-bootstrap/v4/bootstrap/utils"
 	bootstrapConfig "github.com/edgexfoundry/go-mod-bootstrap/v4/config"
 )
@@ -63,6 +64,8 @@ type ConfigurationStruct struct {
 	Database bootstrapConfig.Database
 	// locker protects the 'Writable' from race conditions.
 	locker sync.RWMutex
+	// writableRevision identifies publications, including identical re-enables.
+	writableRevision uint64
 }
 
 // TriggerInfo contains Metadata associated with each Trigger
@@ -168,9 +171,15 @@ type PipelineFunction struct {
 }
 
 type StoreAndForwardInfo struct {
-	Enabled       bool
-	RetryInterval string
-	MaxRetryCount int
+	Enabled           bool
+	RetryInterval     string
+	MaxRetryCount     int
+	MaxBatchItems     int
+	MaxStoredBytes    int64
+	RetentionPolicy   string
+	MinFreeBytes      int64
+	CriticalFreeBytes int64
+	StoragePath       string
 }
 
 // Credentials encapsulates username-password attributes.
@@ -183,18 +192,43 @@ type Credentials struct {
 // then used to overwrite the service's existing configuration struct.
 func (c *ConfigurationStruct) UpdateFromRaw(rawConfig interface{}) bool {
 	configuration, ok := rawConfig.(*ConfigurationStruct)
-	if ok {
-		c.Writable = configuration.Writable
-		c.Registry = configuration.Registry
-		c.Service = configuration.Service
-		c.HttpServer = configuration.HttpServer
-		c.MessageBus = configuration.MessageBus
-		c.Trigger = configuration.Trigger
-		c.ApplicationSettings = configuration.ApplicationSettings
-		c.Clients = configuration.Clients
-		c.Database = configuration.Database
+	if !ok || configuration == nil {
+		return false
 	}
-	return ok
+	snapshot, err := configuration.GetConfigurationSnapshot()
+	if err != nil {
+		return false
+	}
+	configuration = snapshot.(*ConfigurationStruct)
+	// Full updates populate isolated configuration objects during bootstrap.
+	// Live Keeper updates publish only Writable through UpdateWritableFromRaw.
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	c.Writable = configuration.Writable
+	c.writableRevision++
+	c.Registry = configuration.Registry
+	c.Service = configuration.Service
+	c.HttpServer = configuration.HttpServer
+	c.MessageBus = configuration.MessageBus
+	c.Trigger = configuration.Trigger
+	c.ApplicationSettings = configuration.ApplicationSettings
+	c.Clients = configuration.Clients
+	c.Database = configuration.Database
+	return true
+}
+
+var _ bootstrapInterfaces.ConfigurationSnapshotProvider = (*ConfigurationStruct)(nil)
+
+// GetConfigurationSnapshot supplies reflective bootstrap/API readers with an
+// independent configuration whose maps and fields can be read without a lock.
+func (c *ConfigurationStruct) GetConfigurationSnapshot() (bootstrapInterfaces.Configuration, error) {
+	c.locker.RLock()
+	defer c.locker.RUnlock()
+	snapshot := &ConfigurationStruct{}
+	if err := bootstrapUtils.DeepCopy(c, snapshot); err != nil {
+		return nil, err
+	}
+	return snapshot, nil
 }
 
 // EmptyWritablePtr returns a pointer to an empty WritableInfo struct.  It is used by the bootstrap to
@@ -203,18 +237,23 @@ func (c *ConfigurationStruct) EmptyWritablePtr() interface{} {
 	return &WritableInfo{}
 }
 
-// GetWritablePtr returns pointer to the writable section
+// GetWritablePtr returns an independent snapshot for provider serialization.
 func (c *ConfigurationStruct) GetWritablePtr() any {
-	return &c.Writable
+	writable := c.GetWritableInfo()
+	return &writable
 }
 
 // UpdateWritableFromRaw updates the Writeable section of configuration from raw update received from Configuration Provider.
 func (c *ConfigurationStruct) UpdateWritableFromRaw(rawWritable interface{}) bool {
 	writable, ok := rawWritable.(*WritableInfo)
-	if ok {
-		c.Writable = *writable
+	if !ok || writable == nil {
+		return false
 	}
-	return ok
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	c.Writable = cloneWritableInfo(*writable)
+	c.writableRevision++
+	return true
 }
 
 // GetBootstrap returns the configuration elements required by the bootstrap.
@@ -230,41 +269,70 @@ func (c *ConfigurationStruct) GetBootstrap() bootstrapConfig.BootstrapConfigurat
 
 // GetLogLevel returns log level from the configuration
 func (c *ConfigurationStruct) GetLogLevel() string {
+	c.locker.RLock()
+	defer c.locker.RUnlock()
 	return c.Writable.LogLevel
 }
 
 // GetRegistryInfo returns the RegistryInfo section from the configuration
 func (c *ConfigurationStruct) GetRegistryInfo() bootstrapConfig.RegistryInfo {
+	c.locker.RLock()
+	defer c.locker.RUnlock()
 	return c.Registry
 }
 
 // GetInsecureSecrets returns the service's InsecureSecrets.
 func (c *ConfigurationStruct) GetInsecureSecrets() bootstrapConfig.InsecureSecrets {
-	return c.Writable.InsecureSecrets
-}
-
-// GetTelemetryInfo returns the service's Telemetry settings.
-func (c *ConfigurationStruct) GetTelemetryInfo() *bootstrapConfig.TelemetryInfo {
-	return &c.Writable.Telemetry
-}
-
-// GetWritableInfo is thread-safe and returns a read-locked copy of the WritableInfo to prevent race conditions.
-func (c *ConfigurationStruct) GetWritableInfo() WritableInfo {
 	c.locker.RLock()
 	defer c.locker.RUnlock()
-	return c.Writable
+	return cloneInsecureSecrets(c.Writable.InsecureSecrets)
 }
 
-// CopyWritableInfo is thread-safe and returns a copy of the WritableInfo struct.
-// This copy is then returned by the function.
-func (c *ConfigurationStruct) CopyWritableInfo() WritableInfo {
+// GetTelemetryInfo returns a snapshot; reporters obtain a fresh one each pass.
+func (c *ConfigurationStruct) GetTelemetryInfo() *bootstrapConfig.TelemetryInfo {
+	c.locker.RLock()
+	defer c.locker.RUnlock()
+	telemetry := cloneTelemetry(c.Writable.Telemetry)
+	return &telemetry
+}
+
+// GetWritableInfo returns a snapshot including independent nested maps.
+func (c *ConfigurationStruct) GetWritableInfo() WritableInfo {
+	writable, _ := c.GetWritableInfoWithRevision()
+	return writable
+}
+
+// GetWritableInfoWithRevision atomically captures the settings and the revision
+// used to guard any rollback after asynchronous processing.
+func (c *ConfigurationStruct) GetWritableInfoWithRevision() (WritableInfo, uint64) {
+	c.locker.RLock()
+	defer c.locker.RUnlock()
+	return cloneWritableInfo(c.Writable), c.writableRevision
+}
+
+// DisableStoreAndForwardIfRevision rolls back a failed enable only if no newer
+// configuration has been published since that enable was captured.
+func (c *ConfigurationStruct) DisableStoreAndForwardIfRevision(revision uint64) bool {
 	c.locker.Lock()
 	defer c.locker.Unlock()
+	if c.writableRevision != revision {
+		return false
+	}
+	c.Writable.StoreAndForward.Enabled = false
+	c.writableRevision++
+	return true
+}
 
-	var previousWriteable WritableInfo
-	_ = bootstrapUtils.DeepCopy(&c.Writable, &previousWriteable)
+// GetStoreAndForwardInfo reads queue settings without copying unrelated maps.
+func (c *ConfigurationStruct) GetStoreAndForwardInfo() StoreAndForwardInfo {
+	c.locker.RLock()
+	defer c.locker.RUnlock()
+	return c.Writable.StoreAndForward
+}
 
-	return previousWriteable
+// CopyWritableInfo returns an independent snapshot of the writable section.
+func (c *ConfigurationStruct) CopyWritableInfo() WritableInfo {
+	return c.GetWritableInfo()
 }
 
 // SetPipelineFunctionParameterNamesLowercase converts the keys in the WritableInfo's Pipeline's Functions to lowercase.
@@ -272,12 +340,21 @@ func (c *ConfigurationStruct) SetPipelineFunctionParameterNamesLowercase() {
 	c.locker.Lock()
 	defer c.locker.Unlock()
 
+	changed := false
 	for _, function := range c.Writable.Pipeline.Functions {
 		for key := range function.Parameters {
+			lowercase := strings.ToLower(key)
+			if key == lowercase {
+				continue
+			}
 			value := function.Parameters[key]
 			delete(function.Parameters, key) // Make sure the old key has been removed so don't have multiples
-			function.Parameters[strings.ToLower(key)] = value
+			function.Parameters[lowercase] = value
+			changed = true
 		}
+	}
+	if changed {
+		c.writableRevision++
 	}
 }
 
@@ -286,10 +363,13 @@ func (c *ConfigurationStruct) SetWritableInfo(fieldPath string, newValue any) er
 	c.locker.Lock()
 	defer c.locker.Unlock()
 
-	fieldPath = "Writable." + fieldPath
-	currentValue := reflect.ValueOf(c).Elem()
+	next := cloneWritableInfo(c.Writable)
+	currentValue := reflect.ValueOf(&next).Elem()
 	fields := strings.Split(fieldPath, ".")
 	for _, fieldName := range fields {
+		if currentValue.Kind() != reflect.Struct {
+			return fmt.Errorf("no such field: %s in struct", fieldName)
+		}
 		value := currentValue.FieldByName(fieldName)
 		if !value.IsValid() {
 			return fmt.Errorf("no such field: %s in struct", fieldName)
@@ -308,5 +388,8 @@ func (c *ConfigurationStruct) SetWritableInfo(fieldPath string, newValue any) er
 
 	// Set the new value
 	currentValue.Set(newValueVal)
+	// Values supplied by callers can contain maps; retain our own copies.
+	c.Writable = cloneWritableInfo(next)
+	c.writableRevision++
 	return nil
 }
